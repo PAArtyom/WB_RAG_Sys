@@ -36,10 +36,14 @@ embedding = HFEmbeddings(model_name="cointegrated/LaBSE-en-ru")
 # Сохраняем чанки и вопросы+ответы в списке и читаем кэш
 qas = pd.read_csv('data/preprocessed_qa.csv').dropna()
 docs = pd.read_csv('data/docs.csv')["chunk"].to_list()
+
 qas['quesans'] = qas['question'] + "<nt>" + qas['answer']
 quesans = qas['quesans'].tolist()
+qas['vec_question'] = embedding.embed_documents(qas['question'])
+logger.info("Вопросы векторизированы")
 
 cache = pd.read_csv('data/cache.csv')
+cache['vec_question'] = embedding.embed_documents(cache['question'])
 
 
 # Инициализация ретривера
@@ -61,7 +65,7 @@ model_path = "model/model-q2_k.gguf"
 url = 'https://huggingface.co/IlyaGusev/saiga_mistral_7b_gguf/resolve/main/model-q2_K.gguf'
 
 if not os.path.exists(model_path):
-    logger.info("Модель не обнаружена")
+    logger.info("Модель не обнаружена, скачиваем...")
     wget.download(url, model_path)
     logger.info("Модель скачана")
 
@@ -91,8 +95,6 @@ prompt_template = """
 Ответ:
 """
 
-
-memory = ConversationBufferMemory()
 prompt = PromptTemplate(template=prompt_template,
                         input_variables=['context', 'question'])
 chain_type_kwargs = {"prompt": prompt}
@@ -112,8 +114,48 @@ qa = RetrievalQA.from_chain_type(llm=llm,
 def read_root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+def vectorize_and_compare(input_text: str, df_base: pd.DataFrame, df_cache: pd.DataFrame, qas_base: pd.Series,
+                          cache_base: pd.Series, threshold: float = 0.9) -> pd.DataFrame:
+    # Векторизация входного текста
+    input_vector = np.array(embedding.embed_query(input_text))
+
+    # Преобразование векторов в массивы numpy
+    qas_vectors = np.array(qas_base.tolist())
+    cache_vectors = np.array(cache_base.tolist())
+
+    # Проверка размеров векторов
+    if qas_vectors.shape[1] != cache_vectors.shape[1]:
+        raise ValueError(
+            f"Размеры векторов не совпадают: qas_base имеет размер {qas_vectors.shape[1]}, а cache_base - {cache_vectors.shape[1]}")
+
+    if qas_vectors.shape[1] != input_vector.shape[0]:
+        raise ValueError(
+            f"Размеры векторов не совпадают: вектор запроса имеет размер {input_vector.shape[0]}, а векторы вопросов - {qas_vectors.shape[1]}")
+    # Объединение векторов базы и кэша
+    all_vectors = np.vstack((qas_vectors, cache_vectors))
+
+    # Вычисление косинусного сходства
+    similarities = np.dot(all_vectors, input_vector) / (
+                np.linalg.norm(all_vectors, axis=1) * np.linalg.norm(input_vector))
+    # Поиск индекса самого похожего вопроса
+    max_similarity_idx = np.argmax(similarities)
+    max_similarity = similarities[max_similarity_idx]
+
+    if max_similarity < threshold:
+        return pd.DataFrame()  # Возвращает пустой DataFrame, если сходство меньше порога
+
+    # Определение, находится ли наиболее похожий вопрос в базе или в кэше
+    if max_similarity_idx < len(qas_base):
+        similar_text = df_base.iloc[max_similarity_idx]
+    else:
+        similar_text = df_cache.iloc[max_similarity_idx - len(qas_base)]
+
+    return similar_text
+
+
 @app.post("/get_response")
 def get_response(query: str = Form(...)):
+
     start_time = time.time()  # Начало измерения времени
 
     # Проверяем, есть ли вопрос в кэше, если есть, то сразу выдаём ответ
@@ -122,14 +164,24 @@ def get_response(query: str = Form(...)):
         response_time = time.time() - start_time  # Время выполнения
         return JSONResponse(content={"answer": answer, "response_time": response_time})
 
+    # Проверка семантической схожести с существующими вопросами
+    similar_question = vectorize_and_compare(query, qas, cache, qas['vec_question'], cache['vec_question'],
+                                             threshold=0.78)
+
+    if not similar_question.empty:
+        answer = similar_question['answer']
+        response_time = time.time() - start_time  # Время выполнения
+        return JSONResponse(content={"answer": answer, "response_time": response_time})
+
     # Если вопроса нет в кэше, обращаемся к модели
-    response = qa(query)
+    response = qa(query)  
     answer = response['result']
     response_time = time.time() - start_time  # Время выполнения
 
     # Сохраняем ответ в кэше, если ранее его не было
     if query not in cache['question'].values:
-        cache.loc[len(cache)] = {'question': query, 'answer': answer}
-        cache.to_csv("cache.csv", index=False)
+        cache.loc[len(cache)] = {'question': query, 'answer': answer, 'context': response['context'],
+                                 'source_documents': response['source_documents']}
+        cache.to_csv("data/cache.csv", index=False)
 
     return JSONResponse(content={"answer": answer, "response_time": response_time})
