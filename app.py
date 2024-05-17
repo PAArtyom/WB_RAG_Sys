@@ -1,9 +1,8 @@
 from fastapi import FastAPI, Form, Response, Request, Query, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
 
 from loguru import logger
 
@@ -156,7 +155,7 @@ def vectorize_and_compare(input_text: str, df_base: pd.DataFrame, df_cache: pd.D
 @app.post("/get_response")
 def get_response(query: str = Form(...)):
 
-    start_time = time.time()  # Начало измерения времени
+    start_time = time.time()
 
     # Проверяем, есть ли вопрос в кэше, если есть, то сразу выдаём ответ
     if query in cache['question'].values:
@@ -164,9 +163,14 @@ def get_response(query: str = Form(...)):
         response_time = time.time() - start_time  # Время выполнения
         return JSONResponse(content={"answer": answer, "response_time": response_time})
 
+    if query in qas['question'].values:
+        answer = qas[qas['question'] == query]['answer'].values[0]
+        response_time = time.time() - start_time  # Время выполнения
+        return JSONResponse(content={"answer": answer, "response_time": response_time})
+
     # Проверка семантической схожести с существующими вопросами
     similar_question = vectorize_and_compare(query, qas, cache, qas['vec_question'], cache['vec_question'],
-                                             threshold=0.78)
+                                             threshold=0.82)
 
     if not similar_question.empty:
         answer = similar_question['answer']
@@ -174,7 +178,7 @@ def get_response(query: str = Form(...)):
         return JSONResponse(content={"answer": answer, "response_time": response_time})
 
     # Если вопроса нет в кэше, обращаемся к модели
-    response = qa(query)  
+    response = qa(query)  # Ваше обращение к модели
     answer = response['result']
     response_time = time.time() - start_time  # Время выполнения
 
